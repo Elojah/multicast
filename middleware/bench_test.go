@@ -9,8 +9,8 @@ import (
 	"github.com/elojah/multicast/middleware"
 )
 
-// BenchmarkFirstN measures one message under FirstN: without a race, too late for one, and won alone or against losers
-// still running, which the win cancels. Those last two count creating the race.
+// BenchmarkFirstN measures one message: without a race, too late for one, and won alone or against running losers.
+// Those last two count creating the race.
 func BenchmarkFirstN(b *testing.B) {
 	first := middleware.FirstN(1, raceOf)
 	win := first(func(context.Context, uint64, job) error { return nil })

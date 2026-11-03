@@ -20,8 +20,8 @@ type job struct {
 
 func raceOf(j job) *middleware.Race { return j.race }
 
-// The first handler to return nil wins: the ctx of one still handling the message is cancelled, and its error dropped,
-// and one yet to handle it skips it.
+// The first handler to return nil wins: a running one is cancelled, its error dropped, and a later one skips the
+// message.
 func TestFirstN(t *testing.T) {
 	t.Parallel()
 
@@ -75,8 +75,7 @@ func TestFirstN(t *testing.T) {
 	})
 }
 
-// With n = 2, the race goes on after the first winner, and the second ends it: the ctx of the third is cancelled only
-// then.
+// With n = 2, only the second winner cancels the third handler.
 func TestFirstN_Two(t *testing.T) {
 	t.Parallel()
 
@@ -162,8 +161,7 @@ func TestFirstN_NoRace(t *testing.T) {
 	}
 }
 
-// Stop ends a race without a winner: a handler still running has its ctx cancelled and returns nil, one yet to run
-// skips the message, and none wins after.
+// Stop ends a race without a winner: a running handler is cancelled and returns nil, and a later one skips the message.
 func TestRace_Stop(t *testing.T) {
 	t.Parallel()
 
@@ -205,7 +203,7 @@ func TestRace_Stop(t *testing.T) {
 	})
 }
 
-// Stop keeps the winners the race has, and a handler running then, whatever it returns, does not join them.
+// Stop keeps the race's winners, and a handler running then does not join them.
 func TestRace_StopWinners(t *testing.T) {
 	t.Parallel()
 
@@ -227,7 +225,7 @@ func TestRace_StopWinners(t *testing.T) {
 	})
 }
 
-// A handler that ignores its ctx and returns nil once the race has its winners does not join them.
+// A handler ignoring its ctx and returning nil once the race is over does not win.
 func TestFirstN_Late(t *testing.T) {
 	t.Parallel()
 
@@ -274,7 +272,7 @@ func TestRace_Won(t *testing.T) {
 	})
 }
 
-// A race ending once FirstN has checked it, but before the handler joins, makes the handler skip the message.
+// A race ending between FirstN's check and the handler joining makes it skip the message.
 func TestFirstN_EndsWhileJoining(t *testing.T) {
 	t.Parallel()
 
@@ -293,7 +291,7 @@ func TestFirstN_EndsWhileJoining(t *testing.T) {
 	}
 }
 
-// stopping is a ctx stopping race once asked for Done, which FirstN's context.WithCancel does between the two.
+// stopping is a ctx stopping race on Done, which FirstN's context.WithCancel calls between the two.
 type stopping struct {
 	context.Context //nolint:containedctx // wrapped, to be passed on
 
@@ -344,8 +342,8 @@ func TestFirstN_Concurrent(t *testing.T) {
 	}
 }
 
-// running starts a handler that ignores its ctx, and returns once it runs a func that makes it return nil and returns
-// what FirstN made of it.
+// running starts a handler ignoring its ctx. The func returned makes it return nil, and returns what FirstN made of
+// that.
 func running(t *testing.T, first subscriber.Middleware[job], id uint64, msg job) func() error {
 	t.Helper()
 	started := make(chan struct{})

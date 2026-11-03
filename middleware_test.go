@@ -271,8 +271,8 @@ func TestSubscriberWithMiddleware_SubscribeSeq(t *testing.T) {
 	})
 }
 
-// With middleware.FirstN, the first subscribers to handle a message win: the others stop, a Retry wait inside FirstN
-// included, and report nothing. Each counts the message as handled.
+// The first subscribers to handle a message win: the others stop, a Retry inside FirstN included, and report nothing.
+// Each counts the message as handled.
 func TestSubscriberWithMiddleware_FirstN(t *testing.T) {
 	t.Parallel()
 
@@ -336,8 +336,7 @@ func TestSubscriberWithMiddleware_FirstN(t *testing.T) {
 	})
 }
 
-// A subscriber busy while the race ends skips the message once it gets to it: handle never sees it, nothing is reported,
-// and it counts as handled.
+// A subscriber busy while the race ends skips the message, which counts as handled, and reports nothing.
 func TestSubscriberWithMiddleware_FirstNSkip(t *testing.T) {
 	t.Parallel()
 
@@ -380,8 +379,7 @@ func TestSubscriberWithMiddleware_FirstNSkip(t *testing.T) {
 	})
 }
 
-// A subscriber failing before the race ends has not lost: its error is reported and dead-lettered, and it counts as
-// failed, though another wins later.
+// A subscriber failing before the race ends has not lost: its error is reported and stored, and it counts as failed.
 func TestSubscriberWithMiddleware_FirstNFailed(t *testing.T) {
 	t.Parallel()
 
@@ -417,8 +415,7 @@ func TestSubscriberWithMiddleware_FirstNFailed(t *testing.T) {
 	})
 }
 
-// A Retry outside FirstN, which is where a default one sits, cannot see the race: the subscriber waits out the delay,
-// and its next attempt skips the message. Nothing is reported.
+// A Retry outside FirstN waits out its delay, then its next attempt skips the message. Nothing is reported.
 func TestSubscriberWithMiddleware_FirstNInsideRetry(t *testing.T) {
 	t.Parallel()
 
@@ -475,8 +472,8 @@ func TestSubscriberWithMiddleware_FirstNInsideRetry(t *testing.T) {
 	})
 }
 
-// A SubscribeSeq loop's body gets no ctx, so the race cannot cancel it: it can watch Race.Done, and does not win once
-// the race is over. It never sees a message whose race ended first.
+// A SubscribeSeq loop watches Race.Done, does not win once the race is over, and never sees a message whose race ended
+// first.
 func TestSubscriberWithMiddleware_FirstNSeq(t *testing.T) {
 	t.Parallel()
 

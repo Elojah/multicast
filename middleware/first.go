@@ -8,15 +8,14 @@ import (
 	"github.com/elojah/multicast/subscriber"
 )
 
-// Race is what the subscribers FirstN wraps race for: one per message, which carries it. Create one with NewRace.
+// Race is what subscribers under FirstN race for: one per message, which carries it. Create one with NewRace.
 type Race struct {
-	// done is closed once the race has its winners or is stopped.
+	// done is closed once the race is over.
 	done chan struct{}
 
 	mu      sync.Mutex
 	winners []uint64
-	// cancels holds a cancel for each handler that joined, until the race ends: one that has returned stays, since calling
-	// its cancel again does nothing.
+	// cancels holds each joined handler's cancel until the race ends. Calling one that has returned does nothing.
 	cancels []context.CancelFunc
 }
 
@@ -25,15 +24,13 @@ func NewRace() *Race {
 	return &Race{done: make(chan struct{})}
 }
 
-// Done returns a channel closed once FirstN's n subscribers have won, or once Stop is called. It stays open until
-// then, so for good if fewer than n win: every subscriber failing, or too few of them.
+// Done returns a channel closed once n subscribers have won or Stop is called, so never if fewer than n win.
 func (r *Race) Done() <-chan struct{} {
 	return r.done
 }
 
-// Stop ends the race, keeping the winners it has: the subscribers still handling the message have their ctx cancelled,
-// and those yet to handle it skip it, as once it has its winners. Deferred after Publish, it also ends a Retry inside
-// FirstN once the caller gives up.
+// Stop ends the race, keeping its winners: subscribers still handling the message have their ctx cancelled, and those
+// yet to handle it skip it. Deferred after Publish, it also ends a Retry inside FirstN once the caller gives up.
 func (r *Race) Stop() {
 	r.mu.Lock()
 	if !r.over() {
@@ -48,7 +45,7 @@ func (r *Race) Stop() {
 	}
 }
 
-// Winners returns the IDs of the subscribers that have won, in the order they did.
+// Winners returns the IDs of the winners, in the order they won.
 func (r *Race) Winners() []uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -74,8 +71,7 @@ func (r *Race) over() bool {
 	}
 }
 
-// join makes the race call cancel once it ends, and reports whether it is still on, which it may no longer be though
-// over said so.
+// join makes the race call cancel once it ends, or reports false if it already has.
 func (r *Race) join(cancel context.CancelFunc) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -104,20 +100,20 @@ func (r *Race) win(id uint64, n int) {
 	}
 }
 
-// FirstN makes the subscribers race for each message race returns a Race for: the first n whose wrapped handler returns
-// nil win, the n-th cancelling the ctx of every other one still handling the message, and making one yet to handle it
-// skip it. A loser returns nil whatever the wrapped handler returns, since the message was handled: its error is
-// neither reported nor stored, and Stats count it as handled. A subscriber failing while the race is on has not lost:
-// its error is reported as usual, even if another wins later. A message without a Race is handled as usual. n less
-// than 1 means 1.
+// FirstN makes subscribers race for each message race returns a Race for: the first n whose wrapped handler returns nil
+// win, and the n-th ends the race, as Race.Stop does. A message without a Race is handled as usual. n less than 1 means
+// 1.
 //
-// Give it to each subscriber, right after Recover: History then records no loser that has not handled the message, and
-// Retry stops waiting once the race is over. A Retry outside FirstN waits out its delay, as one from
-// multicast.WithDefaultSubscriberOptions does around a FirstN given to Subscribe: give both as defaults. Every
-// subscriber racing for a message needs the same n, so share one: it keeps no state.
+// A loser returns nil whatever the wrapped handler returns: its error is neither reported nor stored, and Stats count
+// the message as handled. A subscriber failing while the race is on has not lost: its error is reported as usual, even
+// if another wins later.
 //
-// With SubscribeSeq, the loop's body wins once it returns without calling fail. It gets no ctx to be cancelled through,
-// so it watches Race.Done. A batch handler does not race. Under a reply.Group, use reply.FirstN.
+// Share one FirstN between the subscribers, which need the same n: it keeps no state. A Retry outside it waits out its
+// delay, as a default one (multicast.WithDefaultSubscriberOptions) does around a FirstN given to Subscribe: give both
+// as defaults.
+//
+// A SubscribeSeq loop's body wins once it returns without calling fail. It has no ctx, so it watches Race.Done. A batch
+// handler does not race. Under a reply.Group, use package reply/middleware's FirstN.
 func FirstN[T any](n int, race func(msg T) *Race) subscriber.Middleware[T] {
 	n = max(n, 1)
 

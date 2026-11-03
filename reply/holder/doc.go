@@ -2,8 +2,7 @@
 //
 //	id, err := g.Subscribe(ctx, handle, subscriber.WithHolder(holder.NewLatest[string, float64](time.Second)))
 //
-// NewLatest answers the requests it merges away with reply.Request.Merge, so that their Publish need not wait for ctx,
-// which package holder's NewLatest leaves them to. NewReorder and NewJitter sort requests by Query. Package holder's
-// other holders take requests as they are: NewBatch, and NewReorderFunc and NewJitterFunc comparing Queries, but
-// NewReduce must merge what it drops with Merge.
+// NewLatest answers the requests it drops, which package holder's leaves waiting for ctx. NewReorder and NewJitter sort
+// requests by Query. Package holder's NewBatch, NewReorderFunc and NewJitterFunc take requests as they are, and so does
+// NewReduce, if it merges what it drops with reply.Request.Merge.
 package holder

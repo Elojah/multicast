@@ -17,6 +17,7 @@ import (
 	"github.com/elojah/multicast/middleware"
 	"github.com/elojah/multicast/reply"
 	replyholder "github.com/elojah/multicast/reply/holder"
+	replymiddleware "github.com/elojah/multicast/reply/middleware"
 	"github.com/elojah/multicast/store"
 	"github.com/elojah/multicast/subscriber"
 )
@@ -32,8 +33,8 @@ type handleFunc = func(ctx context.Context, id uint64, query string) (int, error
 // retryPolicy retries twice, a second apart.
 var retryPolicy = middleware.RetryPolicy{Attempts: 3, Delay: time.Second}
 
-// Every middleware of package middleware, FirstN through reply.FirstN, answers each request under a Group, passed to
-// Subscribe or from multicast.WithDefaultSubscriberOptions, and only Retry adds to Publish's wait: its delays.
+// Every middleware answers each request under a Group, passed to Subscribe or from
+// multicast.WithDefaultSubscriberOptions, FirstN being reply/middleware's. Only Retry adds to Publish's wait.
 func TestMiddlewares(t *testing.T) {
 	t.Parallel()
 
@@ -552,237 +553,6 @@ func TestHolderBatch_Serial(t *testing.T) {
 	})
 }
 
-// Publish returns the winners and those that failed before the race ended, and no loser, whatever its handle returned
-// and wherever FirstN sits. It returns once the last winner has answered and the losers have stopped. With a Retry
-// inside FirstN, the one failing is still waiting when the race ends, so it loses too.
-func TestFirstN(t *testing.T) {
-	t.Parallel()
-
-	for _, tt := range []struct {
-		name  string
-		retry bool
-	}{
-		{name: "alone"},
-		{name: "retry", retry: true},
-	} {
-		for _, byDefault := range []bool{false, true} {
-			t.Run(tt.name+"/"+placement(byDefault), func(t *testing.T) {
-				t.Parallel()
-
-				synctest.Test(t, func(t *testing.T) {
-					race := middleware.NewRace()
-					g, options := groupWith(t, byDefault, func() []subscriber.Option[ask] {
-						middlewares := []subscriber.Middleware[ask]{racing(2, raceOf(race))}
-						if tt.retry {
-							middlewares = append(middlewares, middleware.Retry[ask](middleware.RetryPolicy{Attempts: 3, Delay: time.Hour}))
-						}
-
-						return []subscriber.Option[ask]{subscriber.WithMiddleware(middlewares...)}
-					})
-					// A value along with its error, which no answer may carry.
-					subscribe(t, g, func(ctx context.Context, _ uint64, _ string) (int, error) {
-						<-ctx.Done()
-
-						return 7, ctx.Err()
-					}, options...)
-					failed := subscribe(t, g, failing, options...)
-					slow := func(d time.Duration, value int) handleFunc {
-						return func(context.Context, uint64, string) (int, error) {
-							time.Sleep(d)
-
-							return value, nil
-						}
-					}
-					first := subscribe(t, g, slow(time.Second, 5), options...)
-					second := subscribe(t, g, slow(2*time.Second, 6), options...)
-
-					want := results{first: {Value: 5}, second: {Value: 6}}
-					if !tt.retry {
-						want[failed] = reply.Result[int]{Err: errOffline}
-					}
-					start := time.Now()
-					equal(t, publish(t, g, "north"), want)
-					if elapsed := time.Since(start); elapsed != 2*time.Second {
-						t.Errorf("Publish returned after %v, want %v", elapsed, 2*time.Second)
-					}
-					if winners := race.Winners(); !slices.Equal(winners, []uint64{first, second}) {
-						t.Errorf("Winners returned %v, want [%d %d]", winners, first, second)
-					}
-				})
-			})
-		}
-	}
-}
-
-// A loser ignoring its ctx and answering a value once the race is over holds Publish up, but stays out of it, even from
-// the default options, where it answers before FirstN knows it lost.
-func TestFirstN_Late(t *testing.T) {
-	t.Parallel()
-
-	for _, byDefault := range []bool{false, true} {
-		t.Run(placement(byDefault), func(t *testing.T) {
-			t.Parallel()
-
-			synctest.Test(t, func(t *testing.T) {
-				race := middleware.NewRace()
-				g, options := groupWith(t, byDefault, func() []subscriber.Option[ask] {
-					return []subscriber.Option[ask]{subscriber.WithMiddleware(racing(1, raceOf(race)))}
-				})
-				slow := func(d time.Duration, value int) handleFunc {
-					return func(context.Context, uint64, string) (int, error) {
-						time.Sleep(d)
-
-						return value, nil
-					}
-				}
-				winner := subscribe(t, g, slow(time.Second, 5), options...)
-				subscribe(t, g, slow(2*time.Second, 7), options...)
-
-				start := time.Now()
-				equal(t, publish(t, g, "north"), results{winner: {Value: 5}})
-				if elapsed := time.Since(start); elapsed != 2*time.Second {
-					t.Errorf("Publish returned after %v, want %v", elapsed, 2*time.Second)
-				}
-			})
-		})
-	}
-}
-
-// A SubscribeSeq loop that loses leaves Publish like a handle, having failed the request or answered it.
-func TestFirstN_SubscribeSeq(t *testing.T) {
-	t.Parallel()
-
-	for _, tt := range []struct {
-		name string
-		body func(id uint64, req ask, fail func(error))
-	}{
-		{name: "fail", body: func(_ uint64, _ ask, fail func(error)) { fail(errOffline) }},
-		{name: "answer", body: func(id uint64, req ask, _ func(error)) { req.Answer(id, 7, nil) }},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			synctest.Test(t, func(t *testing.T) {
-				race := middleware.NewRace()
-				option := subscriber.WithMiddleware(racing(1, raceOf(race)))
-				g := newGroup(t)
-				id, seq, err := g.SubscribeSeq(subscribeCtx(t), option)
-				if err != nil {
-					t.Fatalf("SubscribeSeq: %v", err)
-				}
-				go func() {
-					for req, fail := range seq {
-						<-race.Done()
-						tt.body(id, req, fail)
-					}
-				}()
-				winner := subscribe(t, g, func(context.Context, uint64, string) (int, error) {
-					time.Sleep(time.Second)
-
-					return 5, nil
-				}, option)
-
-				start := time.Now()
-				equal(t, publish(t, g, "north"), results{winner: {Value: 5}})
-				if elapsed := time.Since(start); elapsed != time.Second {
-					t.Errorf("Publish returned after %v, want %v", elapsed, time.Second)
-				}
-			})
-		})
-	}
-}
-
-// A request whose race is over leaves Publish without reaching handle or a loop.
-func TestFirstN_Over(t *testing.T) {
-	t.Parallel()
-
-	synctest.Test(t, func(t *testing.T) {
-		race := middleware.NewRace()
-		race.Stop()
-		option := subscriber.WithMiddleware(racing(1, raceOf(race)))
-		g := newGroup(t)
-		subscribe(t, g, func(context.Context, uint64, string) (int, error) {
-			t.Error("handle got a request whose race is over")
-
-			return 0, nil
-		}, option)
-		_, seq, err := g.SubscribeSeq(subscribeCtx(t), option)
-		if err != nil {
-			t.Fatalf("SubscribeSeq: %v", err)
-		}
-		go func() {
-			for req := range seq {
-				t.Errorf("loop got %v, whose race is over", req.Query)
-			}
-		}()
-
-		start := time.Now()
-		equal(t, publish(t, g, "north"), results{})
-		if elapsed := time.Since(start); elapsed != 0 {
-			t.Errorf("Publish returned after %v, want at once", elapsed)
-		}
-	})
-}
-
-// A request merged into one that loses leaves its Publish too.
-func TestFirstN_Merged(t *testing.T) {
-	t.Parallel()
-
-	synctest.Test(t, func(t *testing.T) {
-		race := middleware.NewRace()
-		race.Stop()
-		g := newGroup(t)
-		subscribe(t, g, answering, subscriber.WithHolder[ask](replyholder.NewLatest[string, int](time.Second)),
-			subscriber.WithMiddleware(racing(1, raceOf(race))))
-
-		got, elapsed := publishAll(t, g, "north", "south")
-		for i := range got {
-			equal(t, got[i], results{})
-			if elapsed[i] != time.Second {
-				t.Errorf("Publish %d returned after %v, want %v", i, elapsed[i], time.Second)
-			}
-		}
-	})
-}
-
-// A Retry inside FirstN outlives a Publish whose ctx ends first, as in TestMiddlewareRetry_Context, but Race.Stop ends
-// it, so that it holds up no later Publish.
-func TestFirstN_Stop(t *testing.T) {
-	t.Parallel()
-
-	synctest.Test(t, func(t *testing.T) {
-		race := middleware.NewRace()
-		g := newGroup(t)
-		id := subscribe(t, g, func(_ context.Context, _ uint64, query string) (int, error) {
-			if query == "north" {
-				return 0, errOffline
-			}
-
-			return len(query), nil
-		}, subscriber.WithMiddleware(
-			racing(1, func(query string) *middleware.Race {
-				if query == "north" {
-					return race
-				}
-
-				return nil
-			}),
-			middleware.Retry[ask](middleware.RetryPolicy{Attempts: 3, Delay: time.Hour}),
-		))
-
-		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-		defer cancel()
-		equal(t, g.Publish(ctx, "north"), results{id: {Err: subscriber.ErrTimeout}})
-		race.Stop()
-
-		start := time.Now()
-		equal(t, publish(t, g, "south"), results{id: {Value: 5}})
-		if elapsed := time.Since(start); elapsed != 0 {
-			t.Errorf("next Publish returned after %v, want at once", elapsed)
-		}
-	})
-}
-
 // groupWith returns a Group, and the options to Subscribe with, giving its subscribers options from
 // WithDefaultSubscriberOptions if byDefault, else from Subscribe.
 func groupWith(
@@ -848,7 +618,7 @@ func panicking(context.Context, uint64, string) (int, error) { panic(errOffline)
 
 // racing makes a subscriber race for each request race returns a Race for.
 func racing(n int, race func(query string) *middleware.Race) subscriber.Middleware[ask] {
-	return reply.FirstN[string, int](n, race)
+	return replymiddleware.FirstN[string, int](n, race)
 }
 
 // raceOf returns what gives every request r.

@@ -404,6 +404,84 @@ func TestRequest_AnswerNowhere(t *testing.T) {
 	})
 }
 
+// Hold keeps Publish waiting past the last answer, until Release.
+func TestRequest_Hold(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		g := newGroup(t)
+		id, seq, err := g.SubscribeSeq(subscribeCtx(t))
+		if err != nil {
+			t.Fatalf("SubscribeSeq: %v", err)
+		}
+		go func() {
+			for req := range seq {
+				req.Hold()
+				req.Answer(id, 5, nil)
+				time.Sleep(time.Second)
+				req.Release()
+			}
+		}()
+
+		start := time.Now()
+		equal(t, publish(t, g, "north"), results{id: {Value: 5}})
+		if elapsed := time.Since(start); elapsed != time.Second {
+			t.Errorf("Publish returned after %v, want %v", elapsed, time.Second)
+		}
+	})
+}
+
+// Withdraw takes a subscriber out of Publish, whether it has answered or not, and drops any later answer.
+func TestRequest_Withdraw(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		body func(id uint64, req ask)
+	}{
+		{name: "answered", body: func(id uint64, req ask) {
+			req.Hold()
+			defer req.Release()
+			req.Answer(id, 7, nil)
+			req.Withdraw(id)
+		}},
+		{name: "unanswered", body: func(id uint64, req ask) {
+			req.Withdraw(id)
+			req.Answer(id, 7, nil)
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				g := newGroup(t)
+				id, seq, err := g.SubscribeSeq(subscribeCtx(t))
+				if err != nil {
+					t.Fatalf("SubscribeSeq: %v", err)
+				}
+				go func() {
+					for req := range seq {
+						tt.body(id, req)
+					}
+				}()
+				kept := subscribe(t, g, func(context.Context, uint64, string) (int, error) { return 5, nil })
+
+				equal(t, publish(t, g, "north"), results{kept: {Value: 5}})
+			})
+		})
+	}
+}
+
+// Hold, Release and Withdraw do nothing to a request Group.Publish did not send.
+func TestRequest_HoldNowhere(t *testing.T) {
+	t.Parallel()
+
+	req := ask{Query: "replayed"}
+	req.Hold()
+	req.Withdraw(1)
+	req.Release()
+}
+
 // A Group made elsewhere, with its options, answers once wrapped. Publish does not wait for a subscriber added through
 // the embedded Group.
 func TestGroup_Wrap(t *testing.T) {
