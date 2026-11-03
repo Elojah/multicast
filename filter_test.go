@@ -2,6 +2,7 @@ package multicast_test
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"testing"
 	"testing/synctest"
@@ -199,6 +200,52 @@ func TestMessageWithSubscriberFilter_Several(t *testing.T) {
 			if got := tt.r.messages(); !slices.Equal(got, tt.want) {
 				t.Errorf("%s subscriber got %v, want %v", tt.name, got, tt.want)
 			}
+		}
+	})
+}
+
+// A Publish visits each subscriber its subscriber filter picks, once, before that subscriber's own filters, whether
+// they keep the message or not. Several visits run in order, and a nil one is ignored.
+func TestMessageWithVisit(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		g := newGroup[int](t)
+		// What each subscriber went through, in order. Only Publish's goroutine calls the visits and the filters.
+		calls := map[uint64][]string{}
+		_, skippedID := record(t, g)
+		var rejectingID uint64
+		rejecting := &recorder[int]{}
+		rejectingID = subscribe(t, g, rejecting.handle, subscriber.WithFilter(func(int) bool {
+			calls[rejectingID] = append(calls[rejectingID], "filter")
+
+			return false
+		}))
+		kept, keptID := record(t, g)
+
+		n := g.Publish(t.Context(), 1,
+			message.WithSubscriberFilter[int](func(id uint64) bool { return id != skippedID }),
+			message.WithVisit[int](func(id uint64) { calls[id] = append(calls[id], "first") }),
+			message.WithVisit[int](nil),
+			message.WithVisit[int](func(id uint64) { calls[id] = append(calls[id], "second") }))
+		if n != 1 {
+			t.Errorf("Publish handed the message to %d subscribers, want 1", n)
+		}
+		unsubscribeAll(t, g, skippedID, rejectingID, keptID)
+		synctest.Wait()
+
+		want := map[uint64][]string{
+			rejectingID: {"first", "second", "filter"},
+			keptID:      {"first", "second"},
+		}
+		if !maps.EqualFunc(calls, want, slices.Equal) {
+			t.Errorf("Publish called %v, want %v", calls, want)
+		}
+		if got := rejecting.messages(); len(got) != 0 {
+			t.Errorf("rejecting subscriber got %v, want none", got)
+		}
+		if got, want := kept.messages(), []int{1}; !slices.Equal(got, want) {
+			t.Errorf("kept subscriber got %v, want %v", got, want)
 		}
 	})
 }

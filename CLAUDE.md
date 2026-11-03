@@ -6,7 +6,8 @@ the README, plans in TODO.md.
 ## Layout
 
 - Imports go `multicast` → `subscriber` → `message`. `middleware` and `store` import `subscriber`, never
-  `multicast`. `holder` imports only `message`, `filter` nothing from the library.
+  `multicast`. `holder` imports only `message`, `filter` nothing from the library. `reply` imports `multicast`,
+  `reply/holder` imports `reply` and `holder`, and nothing in the library imports either.
 - In `subscriber`, `deliver.go` runs in the `Publish`'s goroutine, `consume.go` and `holder.go` in the
   subscriber's, `report.go` in either. `inbox` owns the channel and its references, `counters` every counter.
 - `examples/11-mqtt` and `12-modbus` are modules of their own (`replace ../..`), to keep their dependencies out of
@@ -31,6 +32,8 @@ Lint is `default: all` minus a list, tests included: mind `nlreturn`, `parallelt
 - Options have no prefix: `subscriber.WithBuffer`, `message.WithAsync`.
 - `Subscriber` exports only what `Group` calls, so its invariants hold whatever a caller does.
 - Errors are typed structs with a `SubscriberID` and an `Is` matching one sentinel, so `errors.Is` works without `T`.
+  `reply`'s `whose` lists every one that names a message, or a batch for a batch handler's, to answer the requests
+  it lost: add a new one there.
 
 ## Invariants
 
@@ -49,6 +52,8 @@ A change to channels, removal or error reporting must keep these and pass `make 
 - A batch is one send, one reference, one place in `ch` and one report, but `Stats` count its values.
 - No error path the library owns may block. Only `report` calls the error handlers and `Store.Put`, outside the
   middleware chain, with the message's ctx or the subscriber's, never the `Publish`'s.
+- `Publish` calls its subscriber filter, its visit, then that subscriber's own filters, one subscriber at a time in its
+  goroutine: `reply` learns from the last two which subscribers a request reached.
 - Each message a `Publish` picks a subscriber up for is counted once, in `Handled`, `Failed`, `TimedOut`, `Dropped`
   or `Merged`, before `report` (`TestStats_AddUp`).
 - `store.File`'s positions only grow, and its sentinel table (`store/segment.go`) is part of the format: append only.
@@ -63,6 +68,10 @@ A change to channels, removal or error reporting must keep these and pass `make 
 - Connections are the user's: a subscriber reconnects in place, from `handle` or its middlewares. No middleware is
   built in.
 - `Stats` cover only the subscribers still subscribed.
+- Answers ride in the message (`reply.Request`), so the core knows nothing of them. `reply.Group` embeds a `Group`,
+  since a method cannot add the answer's type, and only its `Publish` waits for handling, bounded by its ctx. It waits
+  for the subscribers its filters mark, and answers errors from `report`, through the message's error handler, so the
+  library's typed errors name the subscriber and the request.
 
 ## Tests
 

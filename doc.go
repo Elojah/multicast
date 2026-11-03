@@ -24,6 +24,7 @@
 //
 // Subscriber options are in package subscriber, and WithDefaultSubscriberOptions gives every subscriber some. Publish
 // options are in package message. Packages middleware, store and filter hold ready-made middlewares, stores and filters.
+// Package reply gathers the subscribers' answers to a query.
 //
 // # Delivery
 //

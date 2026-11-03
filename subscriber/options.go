@@ -26,8 +26,10 @@ type config[T any] struct {
 	replay              iter.Seq[T]
 	holder              Holder[T]
 
-	// batchHandler is WithBatchHandler's handle, wrapped in its middlewares.
-	batchHandler Handler[message.Batch[T]]
+	// batchHandler is WithBatchHandler's handle, wrapped in its middlewares, then once New has applied every option, in
+	// batchMiddlewares.
+	batchHandler     Handler[message.Batch[T]]
+	batchMiddlewares []Middleware[message.Batch[T]]
 
 	errorHandler func(ctx context.Context, err error)
 	filter       func(msg T) bool
@@ -89,6 +91,15 @@ func WithBatchHandler[T any](handle Handler[message.Batch[T]], middlewares ...Mi
 		if handle != nil {
 			config.batchHandler = chain(handle, middlewares...)
 		}
+	}
+}
+
+// WithBatchMiddleware appends middlewares around the batch handler and its own middlewares (WithBatchHandler), the
+// first one outermost, whichever option comes first, so that one option can wrap a batch handler another sets. Without
+// a batch handler, they never run.
+func WithBatchMiddleware[T any](middlewares ...Middleware[message.Batch[T]]) Option[T] {
+	return func(config *config[T]) {
+		config.batchMiddlewares = append(config.batchMiddlewares, middlewares...)
 	}
 }
 

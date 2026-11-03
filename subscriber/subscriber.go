@@ -38,6 +38,9 @@ func New[T any](id uint64, options ...Option[T]) *Subscriber[T] {
 	for _, option := range options {
 		option(&config)
 	}
+	if config.batchHandler != nil {
+		config.batchHandler = chain(config.batchHandler, config.batchMiddlewares...)
+	}
 	s := &Subscriber[T]{id: id, config: config, counters: counters{created: time.Now()}}
 	s.inbox.open(config.buffer)
 

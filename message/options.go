@@ -94,3 +94,24 @@ func WithSubscriberFilter[T any](keep func(id uint64) bool) Option[T] {
 		config.SubscriberFilter = func(id uint64) bool { return previous(id) && keep(id) }
 	}
 }
+
+// WithVisit calls visit with the ID of each subscriber Publish gets to, from its goroutine, once WithSubscriberFilter
+// picks it and before the subscriber's own filters (subscriber.WithFilter) see the message. Several WithVisit run in
+// order. A nil visit is ignored, and so is visit in subscriber.WithDefaultMessageOptions.
+func WithVisit[T any](visit func(id uint64)) Option[T] {
+	return func(config *Config) {
+		if visit == nil {
+			return
+		}
+		previous := config.Visit
+		if previous == nil {
+			config.Visit = visit
+
+			return
+		}
+		config.Visit = func(id uint64) {
+			previous(id)
+			visit(id)
+		}
+	}
+}

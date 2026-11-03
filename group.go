@@ -268,6 +268,9 @@ func (g *Group[T]) each(config message.Config, deliver func(s *subscriber.Subscr
 		if !ok || (config.SubscriberFilter != nil && !config.SubscriberFilter(s.ID())) {
 			return true
 		}
+		if config.Visit != nil {
+			config.Visit(s.ID())
+		}
 		taken, parallel := deliver(s)
 		if taken {
 			n++

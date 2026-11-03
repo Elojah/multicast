@@ -175,6 +175,56 @@ func TestSubscriberWithBatchHandler_Errors(t *testing.T) {
 	})
 }
 
+// WithBatchMiddleware wraps the batch handler and its own middlewares, outermost and in order, whichever option comes
+// first, and what it returns is reported. Without a batch handler, it never runs.
+func TestSubscriberWithBatchMiddleware(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		g := newGroup[int](t)
+		calls := &recorder[string]{}
+		named := func(name string) subscriber.Middleware[message.Batch[int]] {
+			return func(next subscriber.Handler[message.Batch[int]]) subscriber.Handler[message.Batch[int]] {
+				return func(ctx context.Context, id uint64, batch message.Batch[int]) error {
+					calls.record(name)
+					if err := next(ctx, id, batch); err != nil {
+						return fmt.Errorf("%s: %w", name, err)
+					}
+
+					return nil
+				}
+			}
+		}
+		var reported []error
+		batched := subscribe(t, g, (&recorder[int]{}).handle,
+			subscriber.WithBatchMiddleware(named("first"), named("second")),
+			subscriber.WithBatchHandler(func(_ context.Context, _ uint64, batch message.Batch[int]) error {
+				calls.record("handler")
+
+				return handleError(batch.Len())
+			}, named("own")),
+			subscriber.WithBatchMiddleware(named("third")),
+			subscriber.WithErrorHandler[int](func(_ context.Context, err error) { reported = append(reported, err) }))
+		unbatched := &recorder[int]{}
+		subscribe(t, g, unbatched.handle, subscriber.WithBatchMiddleware(named("unused")))
+
+		g.PublishBatch(t.Context(), batchOf(1, 2))
+		synctest.Wait()
+
+		if got, want := calls.messages(), []string{"first", "second", "third", "own", "handler"}; !slices.Equal(got, want) {
+			t.Errorf("calls went %v, want %v", got, want)
+		}
+		if want := "first: second: third: own: " + handleError(2).Error(); len(reported) != 1 || reported[0].Error() != want ||
+			!errors.Is(reported[0], handleError(2)) {
+			t.Errorf("error handler got %v, want one error %q wrapping %v", reported, want, handleError(2))
+		}
+		if got, want := unbatched.messages(), []int{1, 2}; !slices.Equal(got, want) {
+			t.Errorf("handle without a batch handler got %v, want %v", got, want)
+		}
+		checkStats(t, g, batched, subscriber.Stats{Delivered: 2, Failed: 2, Batches: 1})
+	})
+}
+
 // A subscriber's filter sees each value of a batch once. Of a batch it keeps part of, the subscriber takes a batch of
 // the same type holding what it keeps, of one it keeps whole, the batch itself, and of one it keeps nothing of,
 // nothing, neither counted nor reported.

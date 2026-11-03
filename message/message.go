@@ -57,6 +57,10 @@ type Config struct {
 	// SubscriberFilter picks, by ID, the subscribers Publish hands the message to. nil means every one. Only a
 	// Publish's own is read.
 	SubscriberFilter func(id uint64) bool
+
+	// Visit gets the ID of each subscriber SubscriberFilter picks, before the subscriber's own filters. nil means none.
+	// Only a Publish's own is read.
+	Visit func(id uint64)
 }
 
 // fields is a set of Config fields.

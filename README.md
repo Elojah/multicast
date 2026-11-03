@@ -53,6 +53,8 @@ for msg, fail := range seq {
 | [`store`](https://pkg.go.dev/github.com/elojah/multicast/store) | Queues for dead letters: `Ring` in memory, `File` on disk, `Drain`, `Enqueue`, `Filter`. |
 | [`holder`](https://pkg.go.dev/github.com/elojah/multicast/holder) | Holders: `Reduce`, `NewLatest`, `Reorder`, `Jitter`, `Batch`. |
 | [`filter`](https://pkg.go.dev/github.com/elojah/multicast/filter) | Stateful filters: `Changed`, `Every`, per key with `WithKey`, with `WithHeartbeat` and `WithHeartbeatCount`. |
+| [`reply`](https://pkg.go.dev/github.com/elojah/multicast/reply) | `Group`, whose subscribers answer a query, and `Request`. |
+| [`reply/holder`](https://pkg.go.dev/github.com/elojah/multicast/reply/holder) | Holders for requests: `NewLatest`, answering those it merges away, `NewReorder` and `NewJitter`, by query. |
 
 ## Delivery
 
@@ -75,8 +77,8 @@ handlers learn why. `subscriber.WithAsyncLimit(n)` bounds the async sends waitin
 so that messages from every goroutine reach every subscriber in the same order, async sends aside.
 
 `subscriber.WithFilter(keep)` skips what `keep` rejects before any send. `message.WithSubscriberFilter(keep)` hands one
-message only to the subscribers `keep` picks by ID. Package `filter` holds stateful filters, so give each subscriber
-its own:
+message only to the subscribers `keep` picks by ID, and `message.WithVisit(visit)` calls `visit` with each of their IDs,
+before their own filters. Package `filter` holds stateful filters, so give each subscriber its own:
 
 ```go
 // Once the temperature has moved by half a degree since the last one passed, and at most once a minute.
@@ -159,6 +161,37 @@ id, err := g.Subscribe(ctx, handle, subscriber.WithBatchHandler(func(ctx context
 ```
 
 A lost batch is reported once, with the batch in the error. Don't change a batch once passed.
+`subscriber.WithBatchMiddleware` wraps the batch handler, whichever option sets it, as `WithDefaultSubscriberOptions`
+may.
+
+## Answers
+
+A `reply.Group` asks its subscribers a query and gathers their answers. Its `Subscribe` takes a `handle` that returns
+a value, and its `Publish` waits for an answer from each subscriber the query reached, or until ctx is done:
+
+```go
+g := reply.New[string, float64]()
+
+id, err := g.Subscribe(ctx, func(ctx context.Context, _ uint64, unit string) (float64, error) {
+	return sensor.Read(ctx, unit)
+})
+...
+ctx, cancel := context.WithTimeout(ctx, time.Second)
+defer cancel()
+results := g.Publish(ctx, "celsius") // each one's Value or Err, by subscriber ID
+```
+
+It embeds a `multicast.Group` of `reply.Request`s, which are messages like any other, so its other methods, filters,
+delivery modes and middlewares apply as they are. `&reply.Group[Q, R]{Group: g}` wraps a Group made elsewhere. An error
+answers once reported, so `middleware.Retry` answers its last attempt and `middleware.Recover` a panic, even from
+`multicast.WithDefaultSubscriberOptions`. A request the library loses answers why, such as a `*subscriber.DroppedError`,
+and one still unanswered once ctx is done a `*subscriber.TimeoutError`. `NewLatest` from `reply/holder`,
+`holder.NewLatest` for requests, answers the ones it merges away with the last one's answer, as a holder of your own
+does with `req.Merge`, such as `holder.NewReduce`'s reduce. A `SubscribeSeq` loop or a batch handler answers with
+`req.Answer`, and the batch handler's error answers each request of the batch.
+
+`Publish` waits for a holder's window, which serial `Publish` calls from one goroutine never share, and for
+`middleware.Retry`'s attempts: `message.WithContext(ctx)` stops them with the `Publish`.
 
 ## Dead letters and replay
 
@@ -212,6 +245,8 @@ keeps what comes meanwhile in order ([`10-reconnect`](examples/10-reconnect/main
 | [`10-reconnect`](examples/10-reconnect/main.go) | A subscriber reconnecting in place, its buffer keeping order. |
 | [`11-mqtt`](examples/11-mqtt/main.go) | MQTT fanned out to a rule, a local store, and an uplink that stores and forwards. |
 | [`12-modbus`](examples/12-modbus/main.go) | A PLC polled over Modbus TCP, and a rule that retries and reconnects. |
+| [`13-reply`](examples/13-reply/main.go) | A `reply.Group` asking every sensor for its reading. |
+| [`14-reply-batch`](examples/14-reply-batch/main.go) | A bus answering the queries that come together in one request, and its error answering them all. |
 
 `11-mqtt` and `12-modbus` are modules of their own, to keep their dependencies out of the library's go.mod.
 `go run -C examples/11-mqtt .` needs an MQTT broker at `MQTT_ADDR` (`localhost:1883` by default). `12-modbus` simulates
@@ -233,8 +268,22 @@ Time per message per subscriber, the median of 6 runs of `make bench` at `e28de1
 | Batch of 16, to a batch handler | 15 ns | 10 ns | 15 ns | 22 ns |
 
 A `Publish` without options allocates nothing in sync, buffered and non-blocking modes. Async allocates once per
-subscriber (110 B), parallel twice (270 B). A `Subscribe` and `Unsubscribe` pair takes 1.2 µs and 12 allocations
+subscriber (130 B), parallel twice (270 B). A `Subscribe` and `Unsubscribe` pair takes 1.2 µs and 12 allocations
 (1.1 KiB).
+
+A `reply.Group`'s `Publish` until every subscriber has answered, next to a `multicast.Group`'s until every subscriber
+has handled the message, both the median of the same 6 runs: time per answer.
+
+| Benchmark | 1 subscriber | 10 | 100 | 1000 |
+| --- | --- | --- | --- | --- |
+| `multicast`, sync, until handled | 691 ns | 657 ns | 653 ns | 475 ns |
+| `multicast`, parallel, until handled | 2.00 µs | 1.81 µs | 879 ns | 763 ns |
+| `reply`, sync | 2.09 µs | 1.48 µs | 1.09 µs | 1.13 µs |
+| `reply`, parallel | 3.83 µs | 2.32 µs | 1.25 µs | 1.43 µs |
+| `reply`, sync, every subscriber failing | 2.20 µs | 1.49 µs | 1.04 µs | 1.13 µs |
+
+A `reply` `Publish` allocates 13 times (960 B), then 3.3 to 4.9 times per subscriber (190 to 270 B), and once more for
+each error (64 B).
 
 ## Development
 
