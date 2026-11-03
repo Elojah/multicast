@@ -53,7 +53,7 @@ for msg, fail := range seq {
 | [`store`](https://pkg.go.dev/github.com/elojah/multicast/store) | Queues for dead letters: `Ring` in memory, `File` on disk, `Drain`, `Enqueue`, `Filter`. |
 | [`holder`](https://pkg.go.dev/github.com/elojah/multicast/holder) | Holders: `Reduce`, `NewLatest`, `Reorder`, `Jitter`, `Batch`. |
 | [`filter`](https://pkg.go.dev/github.com/elojah/multicast/filter) | Stateful filters: `Changed`, `Every`, per key with `WithKey`, with `WithHeartbeat` and `WithHeartbeatCount`. |
-| [`reply`](https://pkg.go.dev/github.com/elojah/multicast/reply) | `Group`, whose subscribers answer a query, and `Request`. |
+| [`reply`](https://pkg.go.dev/github.com/elojah/multicast/reply) | `Group`, whose subscribers answer a query, `Request`, and `FirstN`. |
 | [`reply/holder`](https://pkg.go.dev/github.com/elojah/multicast/reply/holder) | Holders for requests: `NewLatest`, answering those it merges away, `NewReorder` and `NewJitter`, by query. |
 
 ## Delivery
@@ -141,8 +141,9 @@ errors. With `SubscribeSeq`, middlewares wrap the loop body, but `Recover` canno
 
 `middleware.FirstN(n, ...)`, right after `Recover`, makes subscribers race for each message carrying a
 `middleware.Race`: the first n to handle it win, and the n-th cancels the ctx of the others still handling it, and makes
-those yet to start skip it. A loser reports no error, so that the dead letters never keep a message another subscriber
-handled. `race.Stop()` ends a race early, as if it had its winners:
+those yet to start skip it. A loser reports no error, but a subscriber that fails while the race is on does, so the
+dead letters may keep a message another subscriber handles later. `race.Stop()` ends a race early, as if it had its
+winners. `race.Done()` stays open if fewer than n win, so wait on a ctx too:
 
 ```go
 type upload struct {
@@ -155,9 +156,16 @@ _, err := uplinks.Subscribe(ctx, cellular, racing)
 _, err = uplinks.Subscribe(ctx, lora, racing)
 ...
 race := middleware.NewRace()
+defer race.Stop()
 uplinks.Publish(ctx, upload{data: data, race: race})
-<-race.Done() // race.Winners()[0] sent it
+select {
+case <-race.Done(): // race.Winners()[0] sent it
+case <-ctx.Done():
+}
 ```
+
+Keep `FirstN` before `Retry`, whose wait then ends with the race. One outside it waits out its delay, as a `Retry` from
+`multicast.WithDefaultSubscriberOptions` does around a `FirstN` given to `Subscribe`: give both as defaults.
 
 ## Holding and batches
 
@@ -212,6 +220,18 @@ does with `req.Merge`, such as `holder.NewReduce`'s reduce. A `SubscribeSeq` loo
 
 `Publish` waits for a holder's window, which serial `Publish` calls from one goroutine never share, and for
 `middleware.Retry`'s attempts: `message.WithContext(ctx)` stops them with the `Publish`.
+
+`reply.FirstN` is `middleware.FirstN` for queries: a subscriber that loses leaves the `Publish`, which returns the
+winners, and those that failed before the race ended. It still waits for each loser to stop, and `race.Stop()` ends a
+`Retry` inside `FirstN` that would hold up the next `Publish`:
+
+```go
+racing := subscriber.WithMiddleware(reply.FirstN[query, float64](1, func(q query) *middleware.Race { return q.race }))
+...
+race := middleware.NewRace()
+defer race.Stop()
+results := g.Publish(ctx, query{unit: "celsius", race: race})
+```
 
 ## Dead letters and replay
 

@@ -6,8 +6,8 @@ the README, plans in TODO.md.
 ## Layout
 
 - Imports go `multicast` → `subscriber` → `message`. `middleware` and `store` import `subscriber`, never
-  `multicast`. `holder` imports only `message`, `filter` nothing from the library. `reply` imports `multicast`,
-  `reply/holder` imports `reply` and `holder`, and nothing in the library imports either.
+  `multicast`. `holder` imports only `message`, `filter` nothing from the library. `reply` imports `multicast` and
+  `middleware`, `reply/holder` imports `reply` and `holder`, and nothing in the library imports either.
 - In `subscriber`, `deliver.go` runs in the `Publish`'s goroutine, `consume.go` and `holder.go` in the
   subscriber's, `report.go` in either. `inbox` owns the channel and its references, `counters` every counter.
 - `examples/11-mqtt` and `12-modbus` are modules of their own (`replace ../..`), to keep their dependencies out of
@@ -72,6 +72,9 @@ A change to channels, removal or error reporting must keep these and pass `make 
   since a method cannot add the answer's type, and only its `Publish` waits for handling, bounded by its ctx. It waits
   for the subscribers its filters mark, and answers errors from `report`, through the message's error handler, so the
   library's typed errors name the subscriber and the request.
+- `middleware.FirstN`'s nil hides a loser from `reply`, so `reply.FirstN` withdraws it from the `Publish`, which it holds
+  until then, since a loser may answer first. `Race` keeps its handlers' cancels itself: `context.AfterFunc` would start
+  a goroutine per loser.
 
 ## Tests
 

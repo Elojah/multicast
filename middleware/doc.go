@@ -9,7 +9,8 @@
 //	))
 //
 // Recover first catches panics in every later middleware, which Retry then never retries. FirstN, for subscribers
-// racing for a message, goes right after it, so that History never records a loser and Retry stops once the race is
-// over. History records only handled messages, and its failed Put is neither wrapped nor retried, nor is an expired
-// message. Retry after WrapError retries handle's raw errors, so only the last one is wrapped.
+// racing for a message, goes right after it, so that History records no loser that has not handled the message and
+// Retry stops once the race is over. History records only handled messages, and its failed Put is neither wrapped nor
+// retried, nor is an expired message. Retry after WrapError retries handle's raw errors, so only the last one is
+// wrapped.
 package middleware

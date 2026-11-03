@@ -335,3 +335,181 @@ func TestSubscriberWithMiddleware_FirstN(t *testing.T) {
 		}
 	})
 }
+
+// A subscriber busy while the race ends skips the message once it gets to it: handle never sees it, nothing is reported,
+// and it counts as handled.
+func TestSubscriberWithMiddleware_FirstNSkip(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		race := middleware.NewRace()
+		racing := subscriber.WithMiddleware(middleware.FirstN(1, func(msg int) *middleware.Race {
+			if msg == 2 {
+				return race
+			}
+
+			return nil
+		}))
+		g := newGroup[int](t)
+		errs := &recorder[error]{}
+		busy := &recorder[int]{hold: make(chan struct{})}
+		subscribe(t, g, busy.handle, racing, subscriber.WithBuffer[int](1),
+			subscriber.WithErrorHandler[int](func(_ context.Context, err error) { errs.record(err) }))
+		winner := subscribe(t, g, func(context.Context, uint64, int) error { return nil }, racing)
+
+		g.Publish(t.Context(), 1)
+		g.Publish(t.Context(), 2)
+		<-race.Done()
+		busy.release()
+		synctest.Wait()
+
+		if winners := race.Winners(); !slices.Equal(winners, []uint64{winner}) {
+			t.Errorf("Winners returned %v, want [%d]", winners, winner)
+		}
+		if got, want := busy.messages(), []int{1}; !slices.Equal(got, want) {
+			t.Errorf("busy subscriber handled %v, want %v", got, want)
+		}
+		if got := errs.messages(); len(got) != 0 {
+			t.Errorf("error handler got %v, want none", got)
+		}
+		for _, s := range g.Stats() {
+			if s.Handled != 2 || s.Failed != 0 || s.Handling != 0 {
+				t.Errorf("subscriber %d: %+v, want both messages handled and nothing running", s.SubscriberID, s)
+			}
+		}
+	})
+}
+
+// A subscriber failing before the race ends has not lost: its error is reported and dead-lettered, and it counts as
+// failed, though another wins later.
+func TestSubscriberWithMiddleware_FirstNFailed(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		race := middleware.NewRace()
+		racing := subscriber.WithMiddleware(middleware.FirstN(1, func(int) *middleware.Race { return race }))
+		g := newGroup[int](t)
+		dead := &recordStore{}
+		letters := subscriber.WithDeadLetters[int](dead)
+		failed := subscribe(t, g, func(_ context.Context, _ uint64, msg int) error { return handleError(msg) }, racing, letters)
+		winner := subscribe(t, g, func(context.Context, uint64, int) error {
+			time.Sleep(time.Second)
+
+			return nil
+		}, racing, letters)
+
+		g.Publish(t.Context(), 1)
+		<-race.Done()
+		synctest.Wait()
+
+		records := dead.messages()
+		if len(records) != 1 || records[0].SubscriberID != failed || !errors.Is(records[0].Err, handleError(1)) {
+			t.Errorf("store got %v, want a single record of subscriber %d with %v", records, failed, handleError(1))
+		}
+		if winners := race.Winners(); !slices.Equal(winners, []uint64{winner}) {
+			t.Errorf("Winners returned %v, want [%d]", winners, winner)
+		}
+		for _, s := range g.Stats() {
+			if want := s.SubscriberID == failed; (s.Failed == 1) != want || (s.Handled == 1) == want {
+				t.Errorf("subscriber %d: %+v, want the message failed only for %d, and handled otherwise", s.SubscriberID, s, failed)
+			}
+		}
+	})
+}
+
+// A Retry outside FirstN, which is where a default one sits, cannot see the race: the subscriber waits out the delay,
+// and its next attempt skips the message. Nothing is reported.
+func TestSubscriberWithMiddleware_FirstNInsideRetry(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		race := middleware.NewRace()
+		first := middleware.FirstN(1, func(int) *middleware.Race { return race })
+		g := newGroup[int](t)
+		attempts := &recorder[int]{}
+		failures := &recorder[int]{}
+		retrying := subscribe(t, g, func(_ context.Context, _ uint64, msg int) error {
+			attempts.record(msg)
+
+			return handleError(msg)
+		},
+			subscriber.WithMiddleware(middleware.Retry[int](middleware.RetryPolicy{Attempts: 3, Delay: time.Hour}), first),
+			subscriber.WithErrorHandler[int](recordFailures(t, failures)),
+		)
+		subscribe(t, g, func(context.Context, uint64, int) error {
+			time.Sleep(time.Second)
+
+			return nil
+		}, subscriber.WithMiddleware(first))
+
+		g.Publish(t.Context(), 1)
+		<-race.Done()
+		synctest.Wait()
+		handling := func() time.Duration {
+			t.Helper()
+			for _, s := range g.Stats() {
+				if s.SubscriberID == retrying {
+					return s.Handling
+				}
+			}
+			t.Fatalf("Stats has no subscriber %d", retrying)
+
+			return 0
+		}
+		if got := handling(); got != time.Second {
+			t.Errorf("once the race is over, subscriber has been handling for %v, want %v, in its Retry's wait", got, time.Second)
+		}
+
+		time.Sleep(time.Hour)
+		synctest.Wait()
+
+		if got := handling(); got != 0 {
+			t.Errorf("once the delay is over, subscriber has been handling for %v, want it idle", got)
+		}
+		if got, want := attempts.messages(), []int{1}; !slices.Equal(got, want) {
+			t.Errorf("handle got %v, want %v, the next attempt skipping it", got, want)
+		}
+		if got := failures.messages(); len(got) != 0 {
+			t.Errorf("error handler got failures for %v, want none", got)
+		}
+	})
+}
+
+// A SubscribeSeq loop's body gets no ctx, so the race cannot cancel it: it can watch Race.Done, and does not win once
+// the race is over. It never sees a message whose race ended first.
+func TestSubscriberWithMiddleware_FirstNSeq(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		races := map[int]*middleware.Race{1: middleware.NewRace(), 2: middleware.NewRace()}
+		racing := subscriber.WithMiddleware(middleware.FirstN(1, func(msg int) *middleware.Race { return races[msg] }))
+		g := newGroup[int](t)
+		_, seq := subscribeSeq(t, g, racing)
+		seen := &recorder[int]{}
+		go func() {
+			for msg := range seq {
+				seen.record(msg)
+				<-races[msg].Done()
+			}
+		}()
+		winner := subscribe(t, g, func(context.Context, uint64, int) error {
+			time.Sleep(time.Second)
+
+			return nil
+		}, racing)
+
+		g.Publish(t.Context(), 1)
+		<-races[1].Done()
+		synctest.Wait()
+		if winners := races[1].Winners(); !slices.Equal(winners, []uint64{winner}) {
+			t.Errorf("Winners returned %v, want [%d]", winners, winner)
+		}
+
+		races[2].Stop()
+		g.Publish(t.Context(), 2)
+		synctest.Wait()
+		if got, want := seen.messages(), []int{1}; !slices.Equal(got, want) {
+			t.Errorf("loop got %v, want %v", got, want)
+		}
+	})
+}

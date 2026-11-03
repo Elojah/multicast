@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/elojah/multicast/middleware"
+	"github.com/elojah/multicast/subscriber"
 )
 
 // job is a message carrying its race.
@@ -201,6 +203,169 @@ func TestRace_Stop(t *testing.T) {
 			t.Errorf("Winners returned %v, want none", winners)
 		}
 	})
+}
+
+// Stop keeps the winners the race has, and a handler running then, whatever it returns, does not join them.
+func TestRace_StopWinners(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		first := middleware.FirstN(2, raceOf)
+		msg := job{race: middleware.NewRace()}
+
+		finish := running(t, first, 2, msg)
+		if err := first(func(context.Context, uint64, job) error { return nil })(t.Context(), 1, msg); err != nil {
+			t.Errorf("winner returned %v, want nil", err)
+		}
+		msg.race.Stop()
+		if err := finish(); err != nil {
+			t.Errorf("handler running when stopped returned %v, want nil", err)
+		}
+		if winners := msg.race.Winners(); !slices.Equal(winners, []uint64{1}) {
+			t.Errorf("Winners returned %v, want [1]", winners)
+		}
+	})
+}
+
+// A handler that ignores its ctx and returns nil once the race has its winners does not join them.
+func TestFirstN_Late(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		first := middleware.FirstN(1, raceOf)
+		msg := job{race: middleware.NewRace()}
+
+		finish := running(t, first, 2, msg)
+		if err := first(func(context.Context, uint64, job) error { return nil })(t.Context(), 1, msg); err != nil {
+			t.Errorf("winner returned %v, want nil", err)
+		}
+		if err := finish(); err != nil {
+			t.Errorf("late handler returned %v, want nil", err)
+		}
+		if winners := msg.race.Winners(); !slices.Equal(winners, []uint64{1}) {
+			t.Errorf("Winners returned %v, want [1]", winners)
+		}
+	})
+}
+
+// Won tells a winner from a subscriber that returned nil too late, or took no part.
+func TestRace_Won(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		first := middleware.FirstN(1, raceOf)
+		msg := job{race: middleware.NewRace()}
+
+		finish := running(t, first, 2, msg)
+		if msg.race.Won(1) {
+			t.Error("Won reports a winner before any handler returned")
+		}
+		if err := first(func(context.Context, uint64, job) error { return nil })(t.Context(), 1, msg); err != nil {
+			t.Errorf("winner returned %v, want nil", err)
+		}
+		if err := finish(); err != nil {
+			t.Errorf("late handler returned %v, want nil", err)
+		}
+		for id, want := range map[uint64]bool{1: true, 2: false, 3: false} {
+			if got := msg.race.Won(id); got != want {
+				t.Errorf("Won(%d) returned %t, want %t", id, got, want)
+			}
+		}
+	})
+}
+
+// A race ending once FirstN has checked it, but before the handler joins, makes the handler skip the message.
+func TestFirstN_EndsWhileJoining(t *testing.T) {
+	t.Parallel()
+
+	msg := job{race: middleware.NewRace()}
+	calls := 0
+	handle := middleware.FirstN(1, raceOf)(func(context.Context, uint64, job) error {
+		calls++
+
+		return nil
+	})
+	if err := handle(stopping{Context: t.Context(), race: msg.race}, 1, msg); err != nil || calls != 0 {
+		t.Errorf("a handler returned %v after %d calls, want nil after none", err, calls)
+	}
+	if winners := msg.race.Winners(); len(winners) != 0 {
+		t.Errorf("Winners returned %v, want none", winners)
+	}
+}
+
+// stopping is a ctx stopping race once asked for Done, which FirstN's context.WithCancel does between the two.
+type stopping struct {
+	context.Context //nolint:containedctx // wrapped, to be passed on
+
+	race *middleware.Race
+}
+
+func (s stopping) Done() <-chan struct{} {
+	s.race.Stop()
+
+	return s.Context.Done()
+}
+
+// However many handlers return nil at once, exactly n win, each once. In real time, which is what makes them race.
+func TestFirstN_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	const n, handlers = 3, 32
+	first := middleware.FirstN(n, raceOf)
+	for range 100 {
+		msg := job{race: middleware.NewRace()}
+		// So that all are past FirstN's first check before any returns.
+		var inside sync.WaitGroup
+		inside.Add(handlers)
+		handle := first(func(context.Context, uint64, job) error {
+			inside.Done()
+			inside.Wait()
+
+			return nil
+		})
+
+		var wg sync.WaitGroup
+		for id := range uint64(handlers) {
+			wg.Go(func() {
+				if err := handle(t.Context(), id, msg); err != nil {
+					t.Errorf("handler %d returned %v, want nil", id, err)
+				}
+			})
+		}
+		wg.Wait()
+
+		winners := msg.race.Winners()
+		if distinct := len(slices.Compact(slices.Sorted(slices.Values(winners)))); len(winners) != n || distinct != n {
+			t.Fatalf("Winners returned %v, want %d different ones", winners, n)
+		}
+		if !done(msg.race) {
+			t.Fatal("Done is open once the race has its winners")
+		}
+	}
+}
+
+// running starts a handler that ignores its ctx, and returns once it runs a func that makes it return nil and returns
+// what FirstN made of it.
+func running(t *testing.T, first subscriber.Middleware[job], id uint64, msg job) func() error {
+	t.Helper()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- first(func(context.Context, uint64, job) error {
+			close(started)
+			<-release
+
+			return nil
+		})(t.Context(), id, msg)
+	}()
+	<-started
+
+	return func() error {
+		close(release)
+
+		return <-result
+	}
 }
 
 // done reports whether r's Done is closed.

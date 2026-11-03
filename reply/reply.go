@@ -11,7 +11,8 @@
 //
 // A Group is a multicast.Group of Requests, which are messages like any other, so the Group's options, the subscribers'
 // and the Publish's apply as they are. Publish waits until each subscriber the request reached has answered, with its
-// value or an error, why the library lost the request included, or until ctx is done.
+// value or an error, why the library lost the request included, or until ctx is done. With FirstN, only the first
+// subscribers to answer count.
 package reply
 
 import (
@@ -24,6 +25,7 @@ import (
 
 	"github.com/elojah/multicast"
 	"github.com/elojah/multicast/message"
+	"github.com/elojah/multicast/middleware"
 	"github.com/elojah/multicast/subscriber"
 )
 
@@ -128,6 +130,44 @@ func (g *Group[Q, R]) Publish(ctx context.Context, query Q, options ...message.O
 	return c.wait(ctx, req)
 }
 
+// FirstN is middleware.FirstN for a Group, for each query race returns a Race for: a subscriber that loses leaves the
+// Publish, whatever it answered, so that Publish returns the winners, and those that failed before the race ended.
+// Unlike middleware.FirstN, it works from multicast.WithDefaultSubscriberOptions and with SubscribeSeq:
+//
+//	racing := subscriber.WithMiddleware(reply.FirstN[Q, R](1, func(q Q) *middleware.Race { return q.race }))
+//	...
+//	race := middleware.NewRace()
+//	defer race.Stop()
+//	results := g.Publish(ctx, Q{race: race})
+//
+// Publish still waits for each loser to stop, so for one ignoring its ctx or busy with another request, until ctx is
+// done. Stopping the race once Publish returns ends a middleware.Retry inside FirstN that would hold up the next one.
+// Do not end Publish's ctx on Race.Done, which closes before the last winner answers.
+func FirstN[Q, R any](n int, race func(query Q) *middleware.Race) subscriber.Middleware[Request[Q, R]] {
+	first := middleware.FirstN(n, func(req Request[Q, R]) *middleware.Race { return race(req.Query) })
+
+	return func(next subscriber.Handler[Request[Q, R]]) subscriber.Handler[Request[Q, R]] {
+		racing := first(next)
+
+		return func(ctx context.Context, id uint64, req Request[Q, R]) error {
+			r := race(req.Query)
+			if r == nil {
+				return racing(ctx, id, req)
+			}
+			// A loser may answer before it loses: Publish waits to know, so that it never returns that answer.
+			req.each((*collector[Q, R]).hold)
+			defer req.each((*collector[Q, R]).settle)
+
+			err := racing(ctx, id, req)
+			if err == nil && !r.Won(id) {
+				req.each(func(c *collector[Q, R]) { c.withdraw(id) })
+			}
+
+			return err
+		}
+	}
+}
+
 // Request is a message carrying Query, which subscribers answer. Only Group.Publish sets where the answers go: a
 // request published otherwise, replayed or read back from a store has nowhere to send them, so Answer drops them.
 type Request[Q, R any] struct {
@@ -163,6 +203,16 @@ func (r Request[Q, R]) answer(id uint64, result Result[R]) {
 	}
 }
 
+// each calls f with the collector of the Publish that sent r, and those of the requests merged into it.
+func (r Request[Q, R]) each(f func(c *collector[Q, R])) {
+	if r.to != nil {
+		f(r.to)
+	}
+	for _, older := range r.merged {
+		older.each(f)
+	}
+}
+
 // Result is one subscriber's answer: Value, unless Err.
 type Result[R any] struct {
 	Value R
@@ -173,10 +223,10 @@ type Result[R any] struct {
 type collector[Q, R any] struct {
 	// results holds a *Result[R] for each subscriber the request reached, nil until it answers. wait empties it.
 	results sync.Map
-	// reached counts the subscribers reached, and waiting those that have not answered.
+	// reached counts the subscribers reached, and waiting those that have not answered, and those holding Publish.
 	reached atomic.Int64
 	waiting atomic.Int64
-	// answered wakes wait up once waiting reaches 0. Buffered, so that answer never waits.
+	// answered wakes wait up once waiting reaches 0. Buffered, so that settle never waits.
 	answered chan struct{}
 
 	// at is the subscriber Publish is at, set by its visit (message.WithVisit) for reach, which the subscriber's own
@@ -194,9 +244,31 @@ func (c *collector[Q, R]) reach() {
 
 // answer keeps id's result, if Publish waits for it and it has not answered yet. It never blocks.
 func (c *collector[Q, R]) answer(id uint64, result Result[R]) {
-	if !c.results.CompareAndSwap(id, (*Result[R])(nil), &result) {
+	if c.results.CompareAndSwap(id, (*Result[R])(nil), &result) {
+		c.settle()
+	}
+}
+
+// withdraw makes Publish neither wait for id nor return it, even if it has answered, and fails any answer after. It
+// never blocks.
+func (c *collector[Q, R]) withdraw(id uint64) {
+	value, loaded := c.results.LoadAndDelete(id)
+	if !loaded {
 		return
 	}
+	c.reached.Add(-1)
+	if result, _ := value.(*Result[R]); result == nil {
+		c.settle()
+	}
+}
+
+// hold makes Publish wait until the matching settle, for a subscriber it still waits for.
+func (c *collector[Q, R]) hold() {
+	c.waiting.Add(1)
+}
+
+// settle counts a subscriber Publish no longer waits for.
+func (c *collector[Q, R]) settle() {
 	if c.waiting.Add(-1) == 0 {
 		select {
 		case c.answered <- struct{}{}:
@@ -206,7 +278,7 @@ func (c *collector[Q, R]) answer(id uint64, result Result[R]) {
 }
 
 // wait returns each result once all are in or ctx is done, with a *subscriber.TimeoutError about req for the missing
-// ones. It is called once Publish has reached every subscriber, so waiting only goes down.
+// ones. It is called once Publish has reached every subscriber, so waiting stays at 0 once there.
 func (c *collector[Q, R]) wait(ctx context.Context, req Request[Q, R]) map[uint64]Result[R] {
 	// Counted first, so that every answer in is returned even once ctx is done.
 	for c.waiting.Load() > 0 && ctx.Err() == nil {
