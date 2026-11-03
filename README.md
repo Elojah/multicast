@@ -49,7 +49,7 @@ for msg, fail := range seq {
 | [`multicast`](https://pkg.go.dev/github.com/elojah/multicast) | `Group`, `WithSerial`, `WithDefaultSubscriberOptions`. |
 | [`subscriber`](https://pkg.go.dev/github.com/elojah/multicast/subscriber) | Subscriber options, error types, `Stats`, `Holder`. |
 | [`message`](https://pkg.go.dev/github.com/elojah/multicast/message) | `Publish` options, and `Batch` with `Slice` and `Map`. |
-| [`middleware`](https://pkg.go.dev/github.com/elojah/multicast/middleware) | `Recover`, `History`, `MaxAge`, `WrapError`, `Retry`. |
+| [`middleware`](https://pkg.go.dev/github.com/elojah/multicast/middleware) | `Recover`, `History`, `MaxAge`, `WrapError`, `Retry`, and `FirstN` with `Race`. |
 | [`store`](https://pkg.go.dev/github.com/elojah/multicast/store) | Queues for dead letters: `Ring` in memory, `File` on disk, `Drain`, `Enqueue`, `Filter`. |
 | [`holder`](https://pkg.go.dev/github.com/elojah/multicast/holder) | Holders: `Reduce`, `NewLatest`, `Reorder`, `Jitter`, `Batch`. |
 | [`filter`](https://pkg.go.dev/github.com/elojah/multicast/filter) | Stateful filters: `Changed`, `Every`, per key with `WithKey`, with `WithHeartbeat` and `WithHeartbeatCount`. |
@@ -138,6 +138,26 @@ id, err := g.Subscribe(ctx, handle, subscriber.WithMiddleware(
 
 Keep that order: `Recover` first catches panics in every later middleware, and `Retry` after `WrapError` retries raw
 errors. With `SubscribeSeq`, middlewares wrap the loop body, but `Recover` cannot catch a panic in it.
+
+`middleware.FirstN(n, ...)`, right after `Recover`, makes subscribers race for each message carrying a
+`middleware.Race`: the first n to handle it win, and the n-th cancels the ctx of the others still handling it, and makes
+those yet to start skip it. A loser reports no error, so that the dead letters never keep a message another subscriber
+handled. `race.Stop()` ends a race early, as if it had its winners:
+
+```go
+type upload struct {
+ data []byte
+ race *middleware.Race
+}
+
+racing := subscriber.WithMiddleware(middleware.Recover[upload](), middleware.FirstN(1, func(u upload) *middleware.Race { return u.race }))
+_, err := uplinks.Subscribe(ctx, cellular, racing)
+_, err = uplinks.Subscribe(ctx, lora, racing)
+...
+race := middleware.NewRace()
+uplinks.Publish(ctx, upload{data: data, race: race})
+<-race.Done() // race.Winners()[0] sent it
+```
 
 ## Holding and batches
 

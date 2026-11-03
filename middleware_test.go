@@ -270,3 +270,68 @@ func TestSubscriberWithMiddleware_SubscribeSeq(t *testing.T) {
 		}
 	})
 }
+
+// With middleware.FirstN, the first subscribers to handle a message win: the others stop, a Retry wait inside FirstN
+// included, and report nothing. Each counts the message as handled.
+func TestSubscriberWithMiddleware_FirstN(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		type job struct{ race *middleware.Race }
+		g := newGroup[job](t)
+		errs := &recorder[error]{}
+		racing := subscriber.WithMiddleware(
+			middleware.Recover[job](),
+			middleware.FirstN(2, func(j job) *middleware.Race { return j.race }),
+			middleware.Retry[job](middleware.RetryPolicy{Attempts: 3, Delay: time.Hour}),
+		)
+		subscribe := func(handle func(ctx context.Context) error) uint64 {
+			t.Helper()
+
+			return subscribe(t, g, func(ctx context.Context, _ uint64, _ job) error { return handle(ctx) },
+				racing, subscriber.WithErrorHandler[job](func(_ context.Context, err error) { errs.record(err) }))
+		}
+		cancelled := make(chan error, 1)
+		subscribe(func(ctx context.Context) error {
+			<-ctx.Done()
+			cancelled <- ctx.Err()
+
+			return ctx.Err()
+		})
+		first := subscribe(func(context.Context) error {
+			time.Sleep(time.Second)
+
+			return nil
+		})
+		second := subscribe(func(context.Context) error {
+			time.Sleep(2 * time.Second)
+
+			return nil
+		})
+		subscribe(func(context.Context) error { return handleError(1) })
+
+		msg := job{race: middleware.NewRace()}
+		start := time.Now()
+		if n := g.Publish(t.Context(), msg); n != 4 {
+			t.Fatalf("Publish returned %d, want 4", n)
+		}
+		<-msg.race.Done()
+		if elapsed, winners := time.Since(start), msg.race.Winners(); elapsed != 2*time.Second || !slices.Equal(winners, []uint64{first, second}) {
+			t.Errorf("subscribers %v won after %v, want %d and %d after %v", winners, elapsed, first, second, 2*time.Second)
+		}
+		if err := <-cancelled; !errors.Is(err, context.Canceled) {
+			t.Errorf("loser's ctx ended with %v, want %v", err, context.Canceled)
+		}
+		// Lets no time pass: a Retry still waiting would not have returned.
+		synctest.Wait()
+
+		if got := errs.messages(); len(got) != 0 {
+			t.Errorf("error handlers got %v, want none", got)
+		}
+		for _, s := range g.Stats() {
+			if s.Handled != 1 || s.Failed != 0 || s.Handling != 0 {
+				t.Errorf("subscriber %d: %+v, want the message handled and nothing running", s.SubscriberID, s)
+			}
+		}
+	})
+}
