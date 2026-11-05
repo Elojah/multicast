@@ -112,6 +112,8 @@ func TestSubscriberWithHolder_Discard(t *testing.T) {
 		for _, msg := range []int{11, 21, 12} {
 			g.Publish(t.Context(), msg)
 		}
+		// Publish returns once 12 is taken, maybe before it is held: discarding then would report it, and 11 unmerged.
+		synctest.Wait()
 
 		if err := g.Unsubscribe(t.Context(), id, subscriber.WithUnsubscribeDiscard()); err != nil {
 			t.Fatalf("Unsubscribe: %v", err)

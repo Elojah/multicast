@@ -20,7 +20,7 @@ go test -race ./...  # always -race
 make check           # golangci-lint, tests shuffled with -cpu 1,4, each benchmark once
 make stress          # TestStress 50 times
 make benchcmp        # benchstat of main against the working tree
-make tinygo          # TinyGo: pkg/gate's tests, each example run and checked, built for a Pico
+make tinygo          # TinyGo: pkg's tests, each example run and checked, built for a Pico
 ```
 
 Lint is `default: all` minus a list, tests included: mind `nlreturn`, `paralleltest` (`t.Parallel()` first), `err113`,
@@ -43,11 +43,13 @@ A change to channels, removal or error reporting must keep these and pass `make 
   refuses at 0, so a `Publish` racing removal skips the subscriber with a `ClosedError`.
 - Nothing waits for a `Publish` but, with `WithSerial`, the next `Publish`, since `handle` may unsubscribe or
   `Close` while one waits on it. `Unsubscribe` closes `done` to free it, and `Shutdown` waits only on `Consume`.
-- Every removal goes through `Group.remove` (`LoadAndDelete`, then `Subscriber.Unsubscribe`), so racing
-  removals act once, and an eviction is reported once, by the error whose `remove` succeeded.
+- Every removal takes the subscriber out of `subscribers` under its lock (`Group.remove`'s `Delete`, `Close`'s
+  `Clear`), then calls `Subscriber.Unsubscribe`, so racing removals act once, and an eviction is reported once, by the
+  error whose `remove` succeeded.
+- `Publish` gets to subscribers in ID order, from a snapshot: it skips one unsubscribed since, unreported.
 - `discarding` is set before `inbox.stop`, which may close `ch` at once.
 - Only `Consume`'s goroutine reads `ch` and calls the holder. `SubscribeSeq` relays each message from it to the loop.
-- `add` attaches before storing and rechecks `ctx.Err()` after, under the gate, so `Close` refuses or sees each
+- `add` attaches before inserting and rechecks `ctx.Err()` after, under the gate, so `Close` refuses or sees each
   subscriber.
 - A batch is one send, one reference, one place in `ch` and one report, but `Stats` count its values.
 - No error path the library owns may block. Only `report` calls the error handlers and `Store.Put`, outside the

@@ -69,16 +69,16 @@ stress: ## Run TestStress STRESS_COUNT (50) times with race detector
 	$Q $(GO) test -race -run '^TestStress$$' -count $(STRESS_COUNT) .
 
 # TinyGo
-# tinygo test runs no Example, and testing/synctest, which every test but pkg/gate's uses, does not link. So
-# tinygo-test runs pkg/gate's tests, and tinygo-run runs each example and checks its output, both locally. tinygo-build
+# tinygo test runs no Example, and testing/synctest, which every test but pkg's uses, does not link. So
+# tinygo-test runs pkg's tests, and tinygo-run runs each example and checks its output, both locally. tinygo-build
 # only compiles for TINYGO_TARGET.
 .PHONY: tinygo
 tinygo: tinygo-test tinygo-run tinygo-build ## Run tinygo-test, tinygo-run and tinygo-build
 
 .PHONY: tinygo-test
-tinygo-test: ## Run pkg/gate's tests with TinyGo (the others need testing/synctest)
-	$(info $(M) running tinygo test on pkg/gate) @
-	$Q $(TINYGO) test ./pkg/gate
+tinygo-test: ## Run pkg's tests with TinyGo (the others need testing/synctest)
+	$(info $(M) running tinygo test on pkg) @
+	$Q $(TINYGO) test ./pkg/...
 
 .PHONY: tinygo-run
 # An example passes if it prints its Example's output block, in any order under // Unordered output:.

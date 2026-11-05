@@ -132,6 +132,7 @@ func TestSubscriberWithDeadLetters_Lost(t *testing.T) {
 			id := subscribe(t, g, stuck.handle, store, subscriber.WithBuffer[int](1))
 			g.Publish(t.Context(), 0) // stuck holds on to 0, and 1 fills the buffer
 			g.Publish(t.Context(), 1)
+			synctest.Wait()
 			if err := g.Unsubscribe(t.Context(), id, subscriber.WithUnsubscribeDiscard()); err != nil {
 				t.Fatalf("Unsubscribe: %v", err)
 			}

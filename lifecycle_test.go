@@ -249,6 +249,7 @@ func TestMessageWithContext_ErrorHandlers(t *testing.T) {
 			id := subscribe(t, g, held.handle, subscriber.WithBuffer[int](1), errorHandler)
 			g.Publish(t.Context(), 0) // held holds on to 0, and 1 fills the buffer
 			g.Publish(t.Context(), 1, options...)
+			synctest.Wait()
 			if err := g.Unsubscribe(t.Context(), id, subscriber.WithUnsubscribeDiscard()); err != nil {
 				t.Fatalf("Unsubscribe: %v", err)
 			}
@@ -365,6 +366,7 @@ func TestSubscriberWithUnsubscribeOptions(t *testing.T) {
 		for msg := 1; msg <= 3; msg++ {
 			g.Publish(t.Context(), msg)
 		}
+		synctest.Wait()
 		if err := g.Unsubscribe(t.Context(), deliveredID, subscriber.WithUnsubscribeDeliver()); err != nil {
 			t.Fatalf("Unsubscribe: %v", err)
 		}
@@ -513,6 +515,7 @@ func TestSubscriberWithDone(t *testing.T) {
 				// handle holds on to 1, and 2 fills the buffer.
 				g.Publish(t.Context(), 1)
 				g.Publish(t.Context(), 2)
+				synctest.Wait()
 				tt.remove(t, g, id, cancel)
 				synctest.Wait()
 				for _, done := range dones {

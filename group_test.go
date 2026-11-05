@@ -323,6 +323,45 @@ func TestUnsubscribe_SelfDuringPublish(t *testing.T) {
 	})
 }
 
+// Publish gets to subscribers in subscription order, and skips without a report one unsubscribed since it started.
+func TestPublish_SubscriptionOrder(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		const subscribers = 20
+		g := newGroup[int](t)
+		errs := &recorder[error]{}
+		report := subscriber.WithErrorHandler[int](func(_ context.Context, err error) { errs.record(err) })
+		ignore := func(context.Context, uint64, int) error { return nil }
+
+		// The first subscriber's filter, which Publish calls in its goroutine, unsubscribes the second.
+		var second uint64
+		ids := make([]uint64, 0, subscribers)
+		ids = append(ids, subscribe(t, g, ignore, report, subscriber.WithFilter(func(int) bool {
+			unsubscribe(t, g, second)
+
+			return true
+		})))
+		for range subscribers - 1 {
+			ids = append(ids, subscribe(t, g, ignore, report))
+		}
+		second = ids[1]
+
+		var visited []uint64
+		g.Publish(t.Context(), 1, message.WithVisit[int](func(id uint64) { visited = append(visited, id) }))
+		ids = slices.Delete(ids, 1, 2)
+		unsubscribeAll(t, g, ids...)
+		synctest.Wait()
+
+		if !slices.Equal(visited, ids) {
+			t.Errorf("Publish visited %v, want %v", visited, ids)
+		}
+		if got := errs.messages(); len(got) > 0 {
+			t.Errorf("errors reported: %v, want none", got)
+		}
+	})
+}
+
 // Publish waits for a stuck buffered subscriber only once the buffer is full, and what is buffered at Unsubscribe is
 // still handled.
 func TestSubscriberWithBuffer(t *testing.T) {

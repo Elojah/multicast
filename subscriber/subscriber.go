@@ -83,3 +83,13 @@ func (s *Subscriber[T]) Unsubscribe(options ...UnsubscribeOption) {
 	s.stopContextLifetime()
 	s.inbox.stop()
 }
+
+// Unsubscribed reports whether Unsubscribe was called.
+func (s *Subscriber[T]) Unsubscribed() bool {
+	select {
+	case <-s.inbox.done:
+		return true
+	default:
+		return false
+	}
+}

@@ -5,10 +5,10 @@ import (
 	"context"
 	"iter"
 	"slices"
-	"sync"
 	"sync/atomic"
 
 	"github.com/elojah/multicast/message"
+	"github.com/elojah/multicast/pkg/atomic/slice"
 	"github.com/elojah/multicast/pkg/gate"
 	"github.com/elojah/multicast/subscriber"
 )
@@ -16,7 +16,8 @@ import (
 // Group hands each message to every subscriber. Create one with New. It is safe for concurrent use, from handle
 // included.
 type Group[T any] struct {
-	subscribers sync.Map // [uint64]*subscriber.Subscriber[T]
+	// subscribers is sorted by ID, so Publish gets to them in subscription order.
+	subscribers slice.Slice[*subscriber.Subscriber[T]]
 
 	// gate makes Close wait for any add under way, so Close refuses or sees each subscriber.
 	gate gate.Gate
@@ -127,13 +128,9 @@ func (g *Group[T]) Close() error {
 	closed := g.gate.Close()
 
 	// On every call, so no subscriber is left once any Close returns.
-	g.subscribers.Range(func(_, value any) bool {
-		if s, ok := value.(*subscriber.Subscriber[T]); ok {
-			g.remove(s.ID())
-		}
-
-		return true
-	})
+	for _, s := range g.subscribers.Clear() {
+		s.Unsubscribe()
+	}
 
 	if closed {
 		return ErrClosed
@@ -169,7 +166,7 @@ func (g *Group[T]) Shutdown(ctx context.Context) error {
 }
 
 // Publish hands msg to every subscriber the message picks (message.WithSubscriberFilter) and whose own filter keeps
-// it (subscriber.WithFilter), and returns how many took it, counting an async send once started.
+// it (subscriber.WithFilter), in subscription order, and returns how many took it, counting an async send once started.
 //
 // By default it waits for each subscriber in turn, and gives up on one once ctx is done or the message's timeout runs
 // out, reporting why. A ready subscriber takes msg even then. ctx never reaches handle or the error handlers, but
@@ -203,23 +200,16 @@ func (g *Group[T]) PublishBatch(ctx context.Context, batch message.Batch[T], opt
 // Stats returns a snapshot of every subscriber's counters, in subscription order. An unsubscribed subscriber is left
 // out, even while it still handles what it took. It never waits, so handle can call it.
 func (g *Group[T]) Stats() []subscriber.Stats {
-	var stats []subscriber.Stats
-	g.subscribers.Range(func(_, value any) bool {
-		if s, ok := value.(*subscriber.Subscriber[T]); ok {
-			stats = append(stats, s.Stats())
-		}
-
-		return true
-	})
-	// IDs go up in subscription order.
-	slices.SortFunc(stats, func(x, y subscriber.Stats) int {
-		return cmp.Compare(x.SubscriberID, y.SubscriberID)
-	})
+	subscribers := g.subscribers.Load()
+	stats := make([]subscriber.Stats, 0, len(subscribers))
+	for _, s := range subscribers {
+		stats = append(stats, s.Stats())
+	}
 
 	return stats
 }
 
-// add creates and stores a subscriber, or returns ErrClosed. Nothing reads its channel yet.
+// add creates and inserts a subscriber, or returns ErrClosed. Nothing reads its channel yet.
 func (g *Group[T]) add(ctx context.Context, options []subscriber.Option[T]) (*subscriber.Subscriber[T], error) {
 	// Before Enter, since build may call Subscribe or Close.
 	if len(g.defaults) > 0 {
@@ -238,10 +228,10 @@ func (g *Group[T]) add(ctx context.Context, options []subscriber.Option[T]) (*su
 	defer g.gate.Leave()
 	g.running.Add(1)
 
-	// Before Store, so that whoever removes the subscriber stops its ctx watch.
+	// Before Insert, so that whoever removes the subscriber stops its ctx watch.
 	ctx = s.Attach(ctx, func(options ...subscriber.UnsubscribeOption) bool { return g.remove(id, options...) }, g.countOut)
-	g.subscribers.Store(id, s)
-	// If ctx was already done, the watch may have run before Store and found nothing.
+	g.subscribers.Insert(s, byID)
+	// If ctx was already done, the watch may have run before Insert and found nothing.
 	if ctx.Err() != nil {
 		g.remove(id)
 	}
@@ -263,10 +253,10 @@ func (g *Group[T]) each(config message.Config, deliver func(s *subscriber.Subscr
 		// Whether each parallel send was taken.
 		pending []<-chan bool
 	)
-	g.subscribers.Range(func(_, value any) bool {
-		s, ok := value.(*subscriber.Subscriber[T])
-		if !ok || (config.SubscriberFilter != nil && !config.SubscriberFilter(s.ID())) {
-			return true
+	for _, s := range g.subscribers.Load() {
+		// Load is a snapshot: a subscriber removed since is skipped, not reported.
+		if s.Unsubscribed() || (config.SubscriberFilter != nil && !config.SubscriberFilter(s.ID())) {
+			continue
 		}
 		if config.Visit != nil {
 			config.Visit(s.ID())
@@ -278,9 +268,7 @@ func (g *Group[T]) each(config message.Config, deliver func(s *subscriber.Subscr
 		if parallel != nil {
 			pending = append(pending, parallel)
 		}
-
-		return true
-	})
+	}
 
 	// Each send gives up on its own, so this never waits for another Publish.
 	for _, taken := range pending {
@@ -295,8 +283,7 @@ func (g *Group[T]) each(config message.Config, deliver func(s *subscriber.Subscr
 // remove deletes the subscriber and unsubscribes it, or returns false if there is none. Only the deleter unsubscribes,
 // so racing removals do it once.
 func (g *Group[T]) remove(id uint64, options ...subscriber.UnsubscribeOption) bool {
-	v, _ := g.subscribers.LoadAndDelete(id)
-	s, ok := v.(*subscriber.Subscriber[T])
+	s, ok := g.subscribers.Delete(func(s *subscriber.Subscriber[T]) bool { return s.ID() == id })
 	if !ok {
 		return false
 	}
@@ -310,4 +297,9 @@ func (g *Group[T]) countOut() {
 	if g.running.Add(-1) == 0 {
 		close(g.stopped)
 	}
+}
+
+// byID sorts subscribers by ID.
+func byID[T any](x, y *subscriber.Subscriber[T]) int {
+	return cmp.Compare(x.ID(), y.ID())
 }

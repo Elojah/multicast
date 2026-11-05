@@ -70,9 +70,10 @@ The mode is a message option, passed to `Publish` or set as a subscriber's defau
 | Async | `message.WithAsync` | Nothing: each send runs in its own goroutine, out of order. |
 | Non-blocking | `message.WithNonBlocking` | Nothing: a busy subscriber misses the message. |
 
-Delivery is at most once, in publish order from one goroutine, except async. `Publish` gives up on a subscriber
-once its ctx is done or the message's timeout runs out (`message.WithTimeout`, `subscriber.WithTimeout`), and the error
-handlers learn why. `subscriber.WithAsyncLimit(n)` bounds the async sends waiting on a subscriber.
+Delivery is at most once, in publish order from one goroutine, except async. `Publish` gets to subscribers in
+subscription order. It gives up on a subscriber once its ctx is done or the message's timeout runs out
+(`message.WithTimeout`, `subscriber.WithTimeout`), and the error handlers learn why. `subscriber.WithAsyncLimit(n)`
+bounds the async sends waiting on a subscriber.
 
 `multicast.New(multicast.WithSerial[T]())` makes each `Publish` wait for the one under way to return,
 so that messages from every goroutine reach every subscriber in the same order, async sends aside.
