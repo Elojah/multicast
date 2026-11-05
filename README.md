@@ -94,6 +94,17 @@ id, err = sensors.Subscribe(ctx, trend, subscriber.WithFilter(filter.Changed(
 )))
 ```
 
+`message.WithLimit(n)` stops `Publish` once `n` subscribers have taken the message, so a subscriber whose filter
+rejects it, or that misses it, hands it over to the next in subscription order. One that takes it, then fails to handle
+it, does not:
+
+```go
+// Each reading goes up the wired uplink while it is connected, else up the LTE one.
+id, err := uplinks.Subscribe(ctx, wired, subscriber.WithFilter(func(reading) bool { return wiredUp.Load() }))
+id, err = uplinks.Subscribe(ctx, lte, subscriber.WithFilter(func(reading) bool { return lteUp.Load() }))
+uplinks.Publish(ctx, r, message.WithLimit[reading](1))
+```
+
 `multicast.WithDefaultSubscriberOptions(build)` gives each subscriber the options `build` returns, before its
 `Subscribe`'s own, which override them. `build` runs for each subscriber, so that each gets its own filter:
 

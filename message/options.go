@@ -2,6 +2,7 @@ package message
 
 import (
 	"context"
+	"math"
 	"time"
 )
 
@@ -73,6 +74,16 @@ func WithTimeout[T any](timeout time.Duration) Option[T] {
 	return func(config *Config) {
 		config.Timeout = timeout
 		config.set |= fieldTimeout
+	}
+}
+
+// WithLimit makes Publish stop once n subscribers have taken the message, so it reaches the first n in subscription
+// order that take it: one whose filters reject it, or that misses it unsubscribed, timed out or busy, hands over to
+// the next. One that takes it then fails to handle it does not. With WithParallel or WithAsync, a send counts once
+// started. 0 or less means no limit, the default, and n in subscriber.WithDefaultMessageOptions is ignored.
+func WithLimit[T any](n int) Option[T] {
+	return func(config *Config) {
+		config.Limit = uint32(min(uint64(max(n, 0)), math.MaxUint32)) //nolint:gosec // clamped to uint32
 	}
 }
 

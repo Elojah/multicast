@@ -123,6 +123,28 @@ func TestPublish_Filters(t *testing.T) {
 	})
 }
 
+// With message.WithLimit, Publish returns the first subscribers to take the request, in subscription order, and the
+// error of each one before them that missed it.
+func TestPublish_Limit(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		g := newGroup(t)
+		release := make(chan struct{})
+		defer close(release)
+		answer := func(_ context.Context, _ uint64, query string) (int, error) { return len(query), nil }
+		subscribe(t, g, answer, subscriber.WithFilter(func(ask) bool { return false }))
+		busyID := busy(t, g, release)
+		first := subscribe(t, g, answer)
+		subscribe(t, g, answer)
+		// So that only the busy one misses a non-blocking request.
+		synctest.Wait()
+
+		got := publish(t, g, "north", message.WithNonBlocking[ask](), message.WithLimit[ask](1))
+		equal(t, got, results{busyID: {Err: subscriber.ErrDropped}, first: {Value: 5}})
+	})
+}
+
 // Publish waits for every subscriber that took the request, whatever the delivery mode.
 func TestPublish_Delivery(t *testing.T) {
 	t.Parallel()

@@ -42,8 +42,12 @@ type Config struct {
 	Delivery Delivery
 
 	// set holds the fields options set, which New lays over a subscriber's defaults even when zero. Next to Delivery, so
-	// both fit in one word: every async send copies Config to the heap.
+	// with Limit they fit in one word: every async send copies Config to the heap.
 	set fields
+
+	// Limit is how many subscribers Publish hands the message to before it stops. 0 means no limit. Only a Publish's
+	// own is read.
+	Limit uint32
 
 	// Timeout bounds the wait for the subscriber to take the message. 0 means none.
 	Timeout time.Duration

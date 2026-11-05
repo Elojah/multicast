@@ -2,6 +2,7 @@ package multicast_test
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"testing"
@@ -248,6 +249,142 @@ func TestMessageWithVisit(t *testing.T) {
 			t.Errorf("kept subscriber got %v, want %v", got, want)
 		}
 	})
+}
+
+// A Publish with a limit stops once that many subscribers took the message, in subscription order: one whose filter
+// rejects it, or that misses it, hands over to the next, and those after the last are neither visited, reported nor
+// counted.
+func TestMessageWithLimit(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		g := newGroup[int](t)
+		errs := &recorder[error]{}
+		report := subscriber.WithErrorHandler[int](func(_ context.Context, err error) { errs.record(err) })
+		offline := &recorder[int]{}
+		offlineID := subscribe(t, g, offline.handle, report, subscriber.WithFilter(func(int) bool { return false }))
+		busy := &recorder[int]{hold: make(chan struct{})}
+		busyID := subscribe(t, g, busy.handle, report)
+		first, second, last := &recorder[int]{}, &recorder[int]{}, &recorder[int]{}
+		firstID := subscribe(t, g, first.handle, report)
+		secondID := subscribe(t, g, second.handle, report)
+		lastID := subscribe(t, g, last.handle, report)
+
+		// busy holds on to 0.
+		g.Publish(t.Context(), 0, message.WithSubscriberFilter[int](func(id uint64) bool { return id == busyID }))
+		synctest.Wait()
+		// Only Publish's goroutine calls the visit.
+		var visited []uint64
+		n := g.Publish(t.Context(), 1, message.WithNonBlocking[int](), message.WithLimit[int](2),
+			message.WithVisit[int](func(id uint64) { visited = append(visited, id) }))
+		synctest.Wait()
+
+		if n != 2 {
+			t.Errorf("Publish handed the message to %d subscribers, want 2", n)
+		}
+		if want := []uint64{offlineID, busyID, firstID, secondID}; !slices.Equal(visited, want) {
+			t.Errorf("Publish visited %v, want %v", visited, want)
+		}
+		got := errs.messages()
+		var dropped *subscriber.DroppedError[int]
+		if len(got) != 1 || !errors.As(got[0], &dropped) || dropped.SubscriberID != busyID || dropped.Message != 1 {
+			t.Errorf("error handlers got %v, want a single *DroppedError for subscriber %d and message 1", got, busyID)
+		}
+		checkStats(t, g, lastID, subscriber.Stats{})
+
+		busy.release()
+		unsubscribeAll(t, g, offlineID, busyID, firstID, secondID, lastID)
+		synctest.Wait()
+		for _, tt := range []struct {
+			name string
+			r    *recorder[int]
+			want []int
+		}{
+			{name: "offline", r: offline},
+			{name: "busy", r: busy, want: []int{0}},
+			{name: "first", r: first, want: []int{1}},
+			{name: "second", r: second, want: []int{1}},
+			{name: "last", r: last},
+		} {
+			if got := tt.r.messages(); !slices.Equal(got, tt.want) {
+				t.Errorf("%s subscriber got %v, want %v", tt.name, got, tt.want)
+			}
+		}
+	})
+}
+
+// A limit counts subscribers, a batch's included, and parallel or async sends once started. 0 or less, the last
+// WithLimit's, means none, and so does a subscriber's default.
+func TestMessageWithLimit_Count(t *testing.T) {
+	t.Parallel()
+
+	const subscribers = 3
+	for _, tt := range []struct {
+		name      string
+		subscribe []subscriber.Option[int]
+		publish   []message.Option[int]
+		batch     bool
+		want      int
+	}{
+		{name: "sync", publish: []message.Option[int]{message.WithLimit[int](2)}, want: 2},
+		{name: "parallel", publish: []message.Option[int]{message.WithParallel[int](), message.WithLimit[int](2)}, want: 2},
+		{name: "async", publish: []message.Option[int]{message.WithAsync[int](), message.WithLimit[int](2)}, want: 2},
+		{
+			name: "non-blocking", subscribe: []subscriber.Option[int]{subscriber.WithBuffer[int](1)},
+			publish: []message.Option[int]{message.WithNonBlocking[int](), message.WithLimit[int](2)}, want: 2,
+		},
+		{name: "batch", publish: []message.Option[int]{message.WithLimit[int](2)}, batch: true, want: 2},
+		{name: "above subscribers", publish: []message.Option[int]{message.WithLimit[int](5)}, want: subscribers},
+		{name: "zero", publish: []message.Option[int]{message.WithLimit[int](0)}, want: subscribers},
+		{name: "negative", publish: []message.Option[int]{message.WithLimit[int](-1)}, want: subscribers},
+		{
+			name:    "last wins",
+			publish: []message.Option[int]{message.WithLimit[int](1), message.WithLimit[int](0)}, want: subscribers,
+		},
+		{
+			name:      "default ignored",
+			subscribe: []subscriber.Option[int]{subscriber.WithDefaultMessageOptions(message.WithLimit[int](1))},
+			want:      subscribers,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				g := newGroup[int](t)
+				rs := make([]*recorder[int], subscribers)
+				ids := make([]uint64, subscribers)
+				for i := range rs {
+					rs[i] = &recorder[int]{}
+					ids[i] = subscribe(t, g, rs[i].handle, tt.subscribe...)
+				}
+
+				var n int
+				if tt.batch {
+					n = g.PublishBatch(t.Context(), batchOf(1), tt.publish...)
+				} else {
+					n = g.Publish(t.Context(), 1, tt.publish...)
+				}
+				// So that async sends are taken before Unsubscribe.
+				synctest.Wait()
+				unsubscribeAll(t, g, ids...)
+				synctest.Wait()
+
+				if n != tt.want {
+					t.Errorf("Publish handed the message to %d subscribers, want %d", n, tt.want)
+				}
+				for i, r := range rs {
+					var want []int
+					if i < tt.want {
+						want = []int{1}
+					}
+					if got := r.messages(); !slices.Equal(got, want) {
+						t.Errorf("subscriber %d got %v, want %v", i, got, want)
+					}
+				}
+			})
+		})
+	}
 }
 
 func even(msg int) bool {

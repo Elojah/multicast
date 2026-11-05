@@ -166,7 +166,8 @@ func (g *Group[T]) Shutdown(ctx context.Context) error {
 }
 
 // Publish hands msg to every subscriber the message picks (message.WithSubscriberFilter) and whose own filter keeps
-// it (subscriber.WithFilter), in subscription order, and returns how many took it, counting an async send once started.
+// it (subscriber.WithFilter), in subscription order and up to message.WithLimit, and returns how many took it,
+// counting an async send once started.
 //
 // By default it waits for each subscriber in turn, and gives up on one once ctx is done or the message's timeout runs
 // out, reporting why. A ready subscriber takes msg even then. ctx never reaches handle or the error handlers, but
@@ -250,6 +251,8 @@ func (g *Group[T]) each(config message.Config, deliver func(s *subscriber.Subscr
 
 	var (
 		n int
+		// Sends taken, or started for parallel and async ones, against config.Limit.
+		started uint32
 		// Whether each parallel send was taken.
 		pending []<-chan bool
 	)
@@ -267,6 +270,12 @@ func (g *Group[T]) each(config message.Config, deliver func(s *subscriber.Subscr
 		}
 		if parallel != nil {
 			pending = append(pending, parallel)
+		}
+		if taken || parallel != nil {
+			// started is at least 1 here, so a Limit of 0 never stops Publish.
+			if started++; started == config.Limit {
+				break
+			}
 		}
 	}
 
